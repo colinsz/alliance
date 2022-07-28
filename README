@@ -1,6 +1,8 @@
 # examples
-go run server/server.go
+# 启动服务
+docker-composer up
 
+# 启动客户端
 go run client/simple_client.go createAlliance alliance004 colins
 go run client/simple_client.go increaseCapacity alliance004 colins
 go run client/simple_client.go storeItem  alliance004 2 3 4 

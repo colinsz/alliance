@@ -1,11 +1,18 @@
 package alliance
 
 import (
-	"cangku/db"
+	"errors"
 	"fmt"
+	"log"
+
+	"github.com/colinsz/alliance/db"
 
 	"github.com/gomodule/redigo/redis"
 )
+
+var AllianceExist = errors.New("alliance: exist")
+var AllianceNameErr = errors.New("alliance: id len 0")
+var RedisNetworkErr = errors.New("alliance: redis error")
 
 type AllianceManager struct {
 }
@@ -13,39 +20,36 @@ type AllianceManager struct {
 func (am *AllianceManager) QueryByPlayer(playername string) (string, error) {
 	allianceid, err := getPlayerAlliance(playername)
 	if err != nil {
-		return allianceid, err
+		return allianceid, RedisNetworkErr
 	}
 
 	// 检查下公会是否被解散
-	// 如果解散了顺便删除下
-	var existAlliance bool
+	var existAlliance int
 	existAlliance, err = isAllianceList(allianceid)
 	if err != nil {
-		return allianceid, err
+		return allianceid, RedisNetworkErr
 	}
-	if !existAlliance {
+	// 如果解散了顺便删除下
+	if existAlliance == 0 {
 		delAllianceMember(playername)
-		return "", nil
+		allianceid = ""
 	}
 
 	return allianceid, nil
 }
 
-func (am *AllianceManager) Create(id string, playername string) *Alliance {
-	// TODO id - check
-	if len(id) == 0 {
-		return nil
-	}
-
+func (am *AllianceManager) Create(id string, playername string) (*Alliance, error) {
 	// 创建
 	alliance := createAlliance(id, playername)
 	if alliance == nil {
-		return nil
+		log.Println("alliance: createAlliance failed")
+		return nil, AllianceNameErr
 	}
 
 	// 加入公会列表
 	if !addAllianceList(id) {
-		return nil
+		log.Println("alliance: addAllianceList failed")
+		return nil, AllianceExist
 	}
 
 	// 设置玩家预公会的映射
@@ -53,31 +57,50 @@ func (am *AllianceManager) Create(id string, playername string) *Alliance {
 
 	// 存起来公会信息
 	if err := alliance.setAllianceStorageToDB(); err != nil {
-		return nil
+		log.Println("alliance: setAllianceStorageToDB failed")
+		return nil, RedisNetworkErr
 	}
 
-	return alliance
+	return alliance, nil
 }
 
 //
-func (am *AllianceManager) List(id string) []string {
-	return getAllianceList(id)
+func (am *AllianceManager) List() []string {
+	return getAllianceList()
 }
 
 func (am *AllianceManager) Join(playername string, id string) {
 	joinAlliance(playername, id)
 }
 
-func (am *AllianceManager) Dismiss(id string) {
+func (am *AllianceManager) Dismiss(allianceid string, playername string) error {
+	if err := lockAlliance(allianceid); err != nil {
+		return LockErr
+	}
+	defer func() { unlockAlliance(allianceid) }()
+
+	as := &Alliance{}
+	if err := as.getAllianceStorage(allianceid); err != nil {
+		return err
+	}
+
+	// 只允许会长才可以解散
+	if playername == "" || as.OwnerId != playername {
+		return NotAllianceOwner
+	}
+	as.Dismiss = true
+
 	// 从公会列表中删除
-	delAllianceFromList(id)
+	delAllianceFromList(allianceid)
 	// delAllianceMember(id)
 
-	// TODO 公会dismiss标志置位
+	// 公会dismiss标志置位
+	return as.setAllianceStorageToDB()
 }
 
 func createAlliance(id string, playername string) *Alliance {
 	if len(id) == 0 {
+		log.Println("alliance: id = 0")
 		return nil
 	}
 
@@ -105,6 +128,7 @@ func addAllianceList(id string) bool {
 
 	c, err := redis.Int64(conn.Do("sadd", allianceListKey(), id))
 	if err != nil || c == 0 {
+		log.Printf("err:%+v, c:%+v\n", err, c)
 		return false
 	}
 	return true
@@ -121,26 +145,21 @@ func delAllianceFromList(id string) bool {
 	return true
 }
 
-func isAllianceList(id string) (bool, error) {
+func isAllianceList(id string) (int, error) {
 	p := db.GetRedisPool()
 	conn := p.Get()
 
-	c, err := redis.Int(conn.Do("SISMEMBER", allianceListKey(), id))
-	// TODO 如果因网络问题可能导致误认为联盟被解散
-	if err != nil && c != 1 {
-		return false, err
-	}
-	return true, nil
+	return redis.Int(conn.Do("SISMEMBER", allianceListKey(), id))
 }
 
-func getAllianceList(id string) []string {
+func getAllianceList() []string {
 	p := db.GetRedisPool()
 	conn := p.Get()
 
 	r := make([]string, 0)
 	cursor := "0"
 	for {
-		ss, err := redis.Values(redis.Strings(conn.Do("sscan", allianceListKey(), cursor)))
+		ss, err := redis.Values(conn.Do("sscan", allianceListKey(), cursor))
 		if err != nil || len(ss) != 2 {
 			return r
 		}

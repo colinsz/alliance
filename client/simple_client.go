@@ -1,10 +1,11 @@
 package main
 
 import (
-	"cangku/protobuf"
 	"context"
 	"flag"
 	"log"
+
+	"github.com/colinsz/alliance/protobuf"
 
 	"google.golang.org/grpc"
 )
@@ -14,7 +15,7 @@ const addr = "127.0.0.1:12345"
 func main() {
 	flag.Parse()
 	args := flag.Args()
-	if len(args) <= 1 {
+	if len(args) < 1 {
 		return
 	}
 

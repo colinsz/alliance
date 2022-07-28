@@ -1,11 +1,12 @@
 package alliance
 
 import (
-	"cangku/db"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+
+	"github.com/colinsz/alliance/db"
 
 	"github.com/gomodule/redigo/redis"
 )
@@ -15,6 +16,10 @@ var ItemCountErr = errors.New("alliance: item count error")
 var AllianceIsFull = errors.New("alliance: alliance full")
 var GridIndexErr = errors.New("alliance: grid index error")
 var HasIncreased = errors.New("alliance: has increased")
+var LockErr = errors.New("alliance: lock error")
+var NotAllianceOwner = errors.New("alliance: not alliance owner")
+var UnexpectedItermNumber = errors.New("alliance: unexpect item number")
+var AllianceDelete = errors.New("alliance: deleted")
 
 const MaxGridStack = 5
 const MaxAllianceGrid = 30
@@ -27,7 +32,7 @@ type Alliance struct {
 	Dismiss     bool       // 是否已经解散
 }
 
-const EmptyGridItemType = 999999 // 表示公会格子没有道具
+const EmptyGridItemType = 0 // 表示公会格子没有道具
 
 type ItemDesc struct {
 	// Name     string // 道具名
@@ -39,7 +44,7 @@ type ItemDesc struct {
 // 会长修改公会仓库容量
 func (as *Alliance) AllianceStorageIncreaseCapacity(allianceid string, count int) error {
 	if err := lockAlliance(allianceid); err != nil {
-		return errors.New("alliance: lock error")
+		return LockErr
 	}
 	defer func() { unlockAlliance(allianceid) }()
 
@@ -60,31 +65,30 @@ func (as *Alliance) AllianceStorageIncreaseCapacity(allianceid string, count int
 	as.Items = append(as.Items, increaseCap...)
 
 	if err := as.setAllianceStorageToDB(); err != nil {
-		return errors.New("alliance: setAllianceStorage")
+		return RedisNetworkErr
 	}
 
 	return nil
 }
 
 // 会长销毁公会仓库的某格物品
-func (as *Alliance) AllianceStorageDestroyItem(playername string, index int) error {
-	asid := as.AllianceId
-	if err := lockAlliance(asid); err != nil {
-		return errors.New("alliance: lock error")
+func (as *Alliance) AllianceStorageDestroyItem(allianceid, playername string, index int) error {
+	if err := lockAlliance(allianceid); err != nil {
+		return LockErr
 	}
-	defer func() { unlockAlliance(asid) }()
+	defer func() { unlockAlliance(allianceid) }()
 
-	if err := as.getAllianceStorage(asid); err != nil {
+	if err := as.getAllianceStorage(allianceid); err != nil {
 		return err
 	}
 
 	// 只允许会长可以销毁某一格的所有物品
 	if playername == "" || as.OwnerId != playername {
-		return nil
+		return NotAllianceOwner
 	}
 
 	if err := as.destroyItem(index); err != nil {
-		return err
+		return RedisNetworkErr
 	}
 
 	return as.setAllianceStorageToDB()
@@ -93,9 +97,9 @@ func (as *Alliance) AllianceStorageDestroyItem(playername string, index int) err
 // 整理公会仓库
 func (as *Alliance) AllianceStorageClearup(allianceid string) error {
 	if err := lockAlliance(allianceid); err != nil {
-		return err
+		return LockErr
 	}
-	defer func() { lockAlliance(allianceid) }()
+	defer func() { unlockAlliance(allianceid) }()
 
 	if err := as.getAllianceStorage(allianceid); err != nil {
 		return err
@@ -111,9 +115,9 @@ func (as *Alliance) AllianceStorageClearup(allianceid string) error {
 // 普通玩家向公会仓库新增物品
 func (as *Alliance) AllianceStorageAddItem(allianceid string, index int, itemtype int32, num int32) error {
 	if err := lockAlliance(allianceid); err != nil {
-		return err
+		return LockErr
 	}
-	defer func() { lockAlliance(allianceid) }()
+	defer func() { unlockAlliance(allianceid) }()
 
 	if err := as.getAllianceStorage(allianceid); err != nil {
 		return err
@@ -134,7 +138,7 @@ func (as *Alliance) clearup() error {
 		itemType := as.Items[i].ItemType
 		if v, ok := itemTypeMap[itemType]; ok {
 			if as.Items[v].Number > MaxGridStack {
-				return nil
+				return UnexpectedItermNumber
 			}
 			c := MaxGridStack - as.Items[v].Number
 			if as.Items[i].Number < c {
@@ -151,6 +155,12 @@ func (as *Alliance) clearup() error {
 
 	// 2. 排序: 按照类型/数量的优先级排序
 	sort.Slice(as.Items, func(i, j int) bool {
+		if as.Items[i].ItemType == EmptyGridItemType {
+			return false
+		}
+		if as.Items[j].ItemType == EmptyGridItemType {
+			return true
+		}
 		if as.Items[i].ItemType == as.Items[j].ItemType {
 			return as.Items[i].Number > as.Items[j].Number
 		}
@@ -214,8 +224,12 @@ func cachekey(allianceid string) string {
 // 读取仓库物品
 func (as *Alliance) getAllianceStorage(allianceid string) error {
 	err := as.getAllianceStorageFromCache(allianceid)
-	if err == nil {
+	if err == nil && !as.Dismiss {
 		return nil
+	}
+
+	if as.Dismiss {
+		return AllianceDelete
 	}
 
 	// err = as.getAllianceStorageFromDB(allianceid)
@@ -224,7 +238,7 @@ func (as *Alliance) getAllianceStorage(allianceid string) error {
 	// }
 
 	// return as.setAllianceStorageToCache()
-	return err
+	return RedisNetworkErr
 }
 
 func (as *Alliance) getAllianceStorageFromCache(allianceid string) error {
@@ -265,7 +279,10 @@ func (as *Alliance) setAllianceStorageToDB() error {
 	// return as.delAllianceStorageToCache()
 
 	// 直接cache
-	return as.setAllianceStorageToCache()
+	if err := as.setAllianceStorageToCache(); err != nil {
+		return RedisNetworkErr
+	}
+	return nil
 }
 
 // getAllianceStorageFromDB

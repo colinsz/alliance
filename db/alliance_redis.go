@@ -1,15 +1,20 @@
 package db
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/gomodule/redigo/redis"
 )
 
 var redispool *redis.Pool
 
 func InitRedisConnPool() {
+	addr := os.Getenv("REDIS_URL")
+	fmt.Println("init redis: ", addr)
 	redispool = &redis.Pool{
 		Dial: func() (redis.Conn, error) {
-			return redis.Dial("tcp", "127.0.0.1:6379")
+			return redis.Dial("tcp", addr)
 		},
 	}
 }
